@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>BTCUSDT 5m ML Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<style>
+  :root { --bg:#0e1117; --panel:#161b22; --line:#21262d; --txt:#c9d1d9; --acc:#58a6ff; --grn:#3fb950; --red:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--bg); color:var(--txt); }
+  header { display:flex; align-items:center; gap:16px; padding:10px 18px; background:var(--panel); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:5; }
+  header h1 { font-size:15px; margin:0; color:var(--acc); }
+  header .live { font-size:12px; padding:3px 8px; border-radius:10px; background:#1f6feb22; }
+  header .live.on { color:var(--grn); } header .live.off { color:var(--red); }
+  nav { display:flex; gap:6px; }
+  nav button { background:transparent; color:var(--txt); border:1px solid var(--line); padding:5px 12px; border-radius:6px; cursor:pointer; font-size:12px; }
+  nav button.active { background:var(--acc); color:#0e1117; border-color:var(--acc); font-weight:bold; }
+  main { padding:12px 18px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:12px; margin-bottom:14px; }
+  .grid { display:grid; gap:14px; }
+  .cols2 { grid-template-columns: 1fr 1fr; }
+  .chart { width:100%; height:440px; }
+  .chart.sm { height:220px; }
+  .wf-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(440px,1fr)); gap:14px; }
+  .wf-fold { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px; }
+  .wf-fold .wf-fold-chart { width:100%; height:280px; }
+  .wf-fold h4 { margin:2px 6px 4px; font-size:12px; color:var(--acc); }
+  h3 { margin:0 0 8px; font-size:13px; color:var(--acc); }
+  table { border-collapse:collapse; width:100%; font-size:12px; }
+  th,td { padding:5px 8px; border-bottom:1px solid var(--line); text-align:right; }
+  th:first-child,td:first-child { text-align:left; }
+  .pos { color:var(--grn); } .neg { color:var(--red); }
+  .metric { display:inline-block; margin:0 14px 6px 0; font-size:13px; }
+  .metric b { font-size:16px; display:block; }
+  .controls { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-bottom:8px; font-size:12px; }
+  .controls label { display:flex; align-items:center; gap:4px; cursor:pointer; }
+  .hidden { display:none; }
+  .status { font-size:12px; color:#8b949e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>BTC/USDT · 5m ML Bot</h1>
+  <span id="live" class="live off">LIVE: waiting</span>
+  <nav>
+    <button data-view="chart" class="active">Chart</button>
+    <button data-view="backtest">Backtest</button>
+    <button data-view="grid">Grid</button>
+    <button data-view="wf">Walk-Forward</button>
+    <button data-view="live">Live</button>
+  </nav>
+  <span id="health" class="status"></span>
+</header>
+<main>
+
+<section id="view-chart" class="grid">
+  <div class="panel">
+    <div class="controls">
+      <b>Indicators:</b>
+      <label><input type="checkbox" data-ind="rsi"> RSI</label>
+      <label><input type="checkbox" data-ind="macd"> MACD</label>
+      <label><input type="checkbox" data-ind="atr"> ATR%</label>
+      <label><input type="checkbox" data-ind="bb"> BB pos</label>
+      <label><input type="checkbox" data-ind="vwap"> VWAP off</label>
+      <label><input type="checkbox" data-ind="htf"> HTF trend</label>
+      <b style="margin-left:16px">Signals:</b>
+      <label><input type="checkbox" id="show-signals" checked> buy/sell</label>
+      <select id="chart-limit" style="margin-left:auto">
+        <option value="500">500 bars</option><option value="1000">1000</option>
+        <option value="3000" selected>3000</option><option value="6000">6000</option>
+      </select>
+    </div>
+    <div id="candle" class="chart"></div>
+  </div>
+</section>
+
+<section id="view-backtest" class="hidden grid">
+  <div class="panel">
+    <h3>Metrics (out-of-sample)</h3>
+    <div id="bt-metrics"></div>
+    <div id="equity" class="chart"></div>
+  </div>
+  <div class="panel">
+    <h3>Trades (long/short markers)</h3>
+    <div id="bt-trades" class="chart"></div>
+  </div>
+</section>
+
+<section id="view-grid" class="hidden grid">
+  <div class="panel">
+    <h3>Best config</h3>
+    <div id="grid-best"></div>
+  </div>
+  <div class="panel">
+    <h3>Walk-forward per-fold scores</h3>
+    <div id="grid-scores" class="chart"></div>
+  </div>
+</section>
+
+<section id="view-wf" class="hidden">
+  <div class="panel">
+    <h3>Per-fold out-of-sample results</h3>
+    <div id="wf-table"></div>
+  </div>
+  <div class="panel">
+    <h3>Walk-forward equity per fold</h3>
+    <div id="wf-equity-grid" class="wf-grid"></div>
+  </div>
+</section>
+
+<section id="view-live" class="hidden grid cols2">
+  <div class="panel">
+    <h3>Latest candles</h3>
+    <div id="live-candle" class="chart"></div>
+  </div>
+  <div class="panel">
+    <h3>Live signal</h3>
+    <div id="live-box"></div>
+    <div id="live-ind" class="chart sm"></div>
+  </div>
+</section>
+
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

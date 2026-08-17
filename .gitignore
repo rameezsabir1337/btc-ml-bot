@@ -1,0 +1,22 @@
+# python
+.venv/
+__pycache__/
+*.py[cod]
+
+# fetched/generated data + live state
+data/cache/
+data/paper_ledger.csv
+
+# frozen eval + experimental scratch
+frozen_eval/
+walkforward_results.png
+config.json
+deploy_run.py
+
+# historical artifacts (keep only the deployed `best`)
+artifacts/best_*/
+artifacts/deploy_*/
+
+# editor / os
+*.log
+.DS_Store
