@@ -1,5 +1,6 @@
 """Central configuration for the 15m/4h BTCUSDT ML trading bot."""
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,8 @@ MAX_STALE_AGE = 600         # seconds a live candle may lag before considered st
 #   * 15m -> intraday (default); supports 1h/4h HTF trend context
 #   * 4h  -> swing regime: multi-day holds so the ~24bps round-trip cost
 #            amortises over large moves
+#   * 1d  -> slow regime: weekly-hold labels so the spot 24bps round-trip
+#            amortises over the largest moves (spot-fee viability path)
 # (the old 5m mode has been removed)
 SWING = True
 LONG_ONLY = False
@@ -44,6 +47,7 @@ SWING_HTF = [60, 240]          # 1h / 4h HTF trend context (15m default mode)
 MODE_HORIZONS = [24, 48, 96]   # label horizons (in bars) for the active mode
 BARS_PER_YEAR_15M = 365 * 24 * 60 // 15  # 35040
 BARS_PER_YEAR_4H = 365 * 24 // 4         # 2190
+BARS_PER_YEAR_1D = 365                   # 1 bar/day
 BARS_PER_YEAR = BARS_PER_YEAR_15M
 
 # anti-churn / sizing knobs applied to every backtest position map
@@ -65,6 +69,10 @@ def configure_timeframe(tf: str, long_only: bool = False) -> None:
         BARS_PER_YEAR = BARS_PER_YEAR_4H
         SWING_HTF = [1440]               # 1d trend context for the gate
         MODE_HORIZONS = [30, 60, 90]     # 5d / 10d / 15d labels
+    elif tf == "1d":
+        BARS_PER_YEAR = BARS_PER_YEAR_1D
+        SWING_HTF = [10080]              # 1w trend context for the gate
+        MODE_HORIZONS = [7, 14, 30]      # 1w / 2w / 1m labels
     else:
         raise ValueError(f"Unsupported timeframe {tf}")
 
@@ -80,7 +88,12 @@ def configure_timeframe(tf: str, long_only: bool = False) -> None:
     GRID.score_subsample = min(30000, max(1500, int(60 * bars_per_day)))
     GRID.score_fold_cap = WF.n_folds   # rank on ALL folds: selection noise is the enemy
     GRID.min_positive_folds = max(2, min(3, WF.n_folds // 2))
-    GRID.objective_weight_drawdown = 0.5
+    # Spot search (0.10% taker) can bias the grid toward high win-rate + low DD
+    # with BOT_OBJ_DD / BOT_OBJ_WIN. Defaults keep the original Sharpe objective
+    # (win-rate weight must be high to matter: win_rate spans ~0.4-0.6 while
+    # Sharpe swings by units).
+    GRID.objective_weight_drawdown = float(os.environ.get("BOT_OBJ_DD", 0.5))
+    GRID.objective_weight_winrate = float(os.environ.get("BOT_OBJ_WIN", 0.0))
 
     # harden long-only swing trades: minimum 12h hold, vol-scaled sizing
     MIN_HOLD_BARS = 0
@@ -89,14 +102,17 @@ def configure_timeframe(tf: str, long_only: bool = False) -> None:
         MIN_HOLD_BARS = 3     # 3 x 4h = 12h minimum hold
         VOL_TARGET = 0.0      # leave off until we tune it explicitly
 
-
 # ---------------------------------------------------------------------------
-# Costs (Binance USDT-M perp tier — the bot models perp funding, so charge perp
-# fees: taker 0.05%; adjust to your actual tier/discount in production).
+# Costs. Default = Binance VIP0 spot: taker AND maker are both 0.10%. The
+# perp-tuned 4h ensemble assumed 0.05% taker and degrades to negative Sharpe at
+# 0.10%, so the spot artifact must come from a fresh grid search. Override with
+# BOT_TAKER_FEE (e.g. 0.00075 for the BNB-discounted tier) and BOT_USE_FUNDING.
 # ---------------------------------------------------------------------------
-TAKER_FEE = 0.0005          # 0.05% USDT-M perp taker
+TAKER_FEE = float(os.environ.get("BOT_TAKER_FEE", 0.0010))   # per side
 SLIPPAGE_BPS = 2.0          # per-side slippage in basis points
-USE_FUNDING = True          # charge real funding paid while in-position (perps)
+# Spot pays no funding. The perp funding/OI series remain USED AS FEATURES
+# (crowding signals) but are not charged in PnL unless BOT_USE_FUNDING=1.
+USE_FUNDING = os.environ.get("BOT_USE_FUNDING", "0") == "1"
 FUNDING_RATE = 0.0001       # fallback per-8h funding rate when no funding series loaded
 
 # Entry filter: only go long/short when predicted probability gap is above this.
@@ -163,6 +179,7 @@ class GridConfig:
     n_jobs: int = -1                   # parallel workers (-1 = all cores)
     seed: int = 42
     objective_weight_drawdown: float = 0.5   # Sharpe - w*MaxDD composite
+    objective_weight_winrate: float = 0.0    # + w*(win_rate - 0.5) in the objective
     min_config_trades: int = 100       # discard configs with too few trades
     cv_folds: int = 1                  # inner validation per config (1 = last-20% split)
     score_subsample: int = 30000       # cap train rows while scoring configs (speed)
@@ -180,4 +197,4 @@ GRID = GridConfig()
 # ---------------------------------------------------------------------------
 LIVE_POLL_SECONDS = 5
 LIVE_TAIL_BARS = 500          # recent window kept for live recompute
-LIVE_RETRAIN_SECONDS = 7 * 86400   # refit the deployed model on this cadence
+LIVE_RETRAIN_SECONDS = int(os.environ.get("BOT_RETRAIN_SECONDS", 7 * 86400))  # refit cadence

@@ -184,6 +184,7 @@ FEATURE_COLUMNS = [
     "adx", "pdi", "mdi", "streak",
     "htf15_ret", "htf15_slope", "htf60_ret", "htf60_slope",
     "htf240_ret", "htf240_slope", "htf1440_ret", "htf1440_slope",
+    "htf10080_ret", "htf10080_slope",
 ] + [f"ret_{w}" for w in ROLL_WINDOWS] + [f"z_{w}" for w in ROLL_WINDOWS] \
     + [f"sma_off_{w}" for w in ROLL_WINDOWS] + [f"ema_off_{w}" for w in ROLL_WINDOWS] \
     + [f"vol_{w}" for w in ROLL_WINDOWS] + [f"vol_z_{w}" for w in ROLL_WINDOWS] \

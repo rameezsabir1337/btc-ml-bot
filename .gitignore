@@ -1,22 +1,36 @@
 # python
 .venv/
+venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# local secrets / environment overrides
+.env
+.env.*
+# local editor/tool config (NOT the bot config, which lives in config.py)
+config.json
 
 # fetched/generated data + live state
-data/cache/
-data/paper_ledger.csv
+data/
 
 # frozen eval + experimental scratch
 frozen_eval/
 walkforward_results.png
-config.json
-deploy_run.py
+_exp_*.py
+_diag_folds.py
 
 # historical artifacts (keep only the deployed `best`)
 artifacts/best_*/
 artifacts/deploy_*/
 
-# editor / os
+# editors / tooling
+.ruff_cache/
+.idea/
+.vscode/
+.ipynb_checkpoints/
+
+# logs / os
 *.log
 .DS_Store

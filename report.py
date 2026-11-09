@@ -53,13 +53,15 @@ def build_report(best_c, folds, fold_metrics, ranked, ensemble_members=None,
             "funding_gate": float(best_c.get("funding_gate", 0.0) or 0.0),
             "vol_target": float(best_c.get("vol_target", 0.0) or 0.0),
             "dd_brake": float(best_c.get("dd_brake", 0.0) or 0.0),
+            "min_hold_bars": int(best_c.get("min_hold_bars", config.MIN_HOLD_BARS or 0)),
         },
         "ensemble": [{"model": c["model"], "model_params": c["model_params"],
                       "label": c["label"], "margin": c["margin"],
                       "trend_gate": c.get("trend_gate", "none"),
                       "funding_gate": float(c.get("funding_gate", 0.0) or 0.0),
                       "vol_target": float(c.get("vol_target", 0.0) or 0.0),
-                      "dd_brake": float(c.get("dd_brake", 0.0) or 0.0)}
+                      "dd_brake": float(c.get("dd_brake", 0.0) or 0.0),
+                      "min_hold_bars": int(c.get("min_hold_bars", config.MIN_HOLD_BARS or 0))}
                      for c in (ensemble_members or [])],
         "pooled_metrics": pooled,
         "num_folds_evaluated": len(fold_metrics),
@@ -75,6 +77,7 @@ def build_report(best_c, folds, fold_metrics, ranked, ensemble_members=None,
         "vol_target": config.VOL_TARGET,
         "use_funding": config.USE_FUNDING,
         "rollover": rolled_metrics is not None,
+        "retrain_seconds": getattr(config, "LIVE_RETRAIN_SECONDS", 7 * 86400),
     }
     if ensemble_members:
         report["meta"]["ensemble_vote"] = {

@@ -19,7 +19,7 @@ def main():
     ap = argparse.ArgumentParser(description="BTCUSDT ML trading bot (walk-forward grid search)")
     ap.add_argument("--days", type=int, default=config.HISTORY_DAYS)
     ap.add_argument("--tf", type=str, default=config.TIMEFRAME,
-                    choices=["15m", "4h"],
+                    choices=["15m", "4h", "1d"],
                     help="bar timeframe; tunes fold/grid bounds")
     ap.add_argument("--long-only", action="store_true",
                     help="never take short positions (clamp negatives to 0)")
@@ -34,6 +34,8 @@ def main():
     ap.add_argument("--combine", type=str, default="vote", choices=["vote", "blend"],
                     help="ensemble combiner: 'vote' = Sharpe-weighted majority vote, "
                          "'blend' = average scores w/ htf1440 trend gate (long-only)")
+    ap.add_argument("--vote", type=float, default=0.5,
+                    help="ensemble vote threshold (agreement required to go long)")
     ap.add_argument("--force-refresh", action="store_true")
     ap.add_argument("--max-configs", type=int, default=config.GRID.max_configs)
     ap.add_argument("--n-jobs", type=int, default=config.GRID.n_jobs)
@@ -85,7 +87,7 @@ def main():
         print(f"      ensemble of {len(members)} ({args.combine}): "
               + ", ".join(f"{c['model']}/{c['label']['method']}" for c in members))
         folds, fold_metrics, trades_by_fold, rolled, vet_weights = combined_walkforward(
-            members, X, df, arrs, combine=args.combine)
+            members, X, df, arrs, combine=args.combine, vote=args.vote)
         best_c = members[0]
         _vet_weights = vet_weights
     else:

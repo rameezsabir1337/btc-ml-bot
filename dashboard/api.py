@@ -32,6 +32,9 @@ ARTIFACT_NAME = "best"
 _data, _X, _df, _preds = load_artifacts(ARTIFACT_NAME)
 # adopt the mode the artifacts were produced in (4h / long-only / sizing knobs)
 _meta = _data["report"].get("meta", {})
+# adopt the retrain cadence the run was built under (env BOT_RETRAIN_SECONDS
+# can still override at dashboard start; mirrors config.LIVE_RETRAIN_SECONDS)
+_RETRAIN_S = float(_meta.get("retrain_seconds", config.LIVE_RETRAIN_SECONDS))
 if not _meta or not _meta.get("timeframe"):
     # Fallback for artifacts saved before `meta` was persisted: infer the bar
     # regime from the spacing of the stored OHLCV index.
@@ -58,6 +61,35 @@ _ENSEMBLE = len(_ENS) >= 2 and bool(_ENS_VET.get("weights"))
 if _ENSEMBLE:
     _ens_weights = [float(w) for w in _ENS_VET["weights"]]
     _ens_vote_th = float(_ENS_VET.get("vote", 0.5))
+# Option-B regime-adaptive ensemble: pick per-regime member weights + a regime-
+# dependent vote threshold from the weekly-slope gate. Persisted by promote_vote.
+_RG = (_data["report"].get("meta") or {}).get("regime") or {}
+_RG_ENABLED = bool(_RG and _RG.get("rows"))
+_rg_equal = bool(_RG.get("weights_equal", False)) if _RG else False
+_rg_policy = (_RG.get("entry_policy") or None) if _RG else None
+if _RG_ENABLED:
+    # mean member weights per fold class (up / flat / down)
+    _rg_weights = {
+        "up": [], "flat": [], "down": [],
+    }
+    for _dom, _wrow in _RG["rows"]:
+        _rg_weights.setdefault(_dom, []).append([float(x) for x in _wrow])
+    _rg_weights = {k: (np.mean(v, axis=0).tolist() if v else None)
+                   for k, v in _rg_weights.items()}
+    _rg_gate = _RG.get("gate_col", "htf10080_slope")
+    _rg_confirm = int(_RG.get("confirm", 2))
+    _rg_soft_low = float(_RG.get("soft_low", 0.25))
+    _rg_soft_mid = float(_RG.get("soft_mid", 0.50))
+    # equal-weight vote: no fold's own OOS Sharpe leaks into its own positions
+    _rg_equal = bool(_RG.get("weights_equal", False))
+    # regime-adaptive entry policy: per-regime vote threshold + entry condition
+    _rg_policy = _RG.get("entry_policy") or None
+    if _rg_equal and _ENS:
+        _one = [1.0] * len(_ENS)
+        _rg_weights = {k: list(_one) for k in ("up", "flat", "down")}
+if _ENSEMBLE and _RG and _RG.get("weights_equal"):
+    _ens_weights = [1.0] * len(_ens_weights)
+
 # columns the deployed model actually uses (includes perp funding + OI regime)
 _MODEL_COLS = [c for c in (list(FEATURE_COLUMNS) + list(FUNDING_COLUMNS)
                            + list(OI_COLUMNS)) if c in _X.columns]
@@ -135,6 +167,25 @@ def _fit_one(c, df, X):
     model = model.fit(Xtr.values, encode_y(ytr, task))
     model.train_n = int(len(ytr))
     return model, task
+
+
+def _regime_class(feats, gate_col, confirm):
+    """Classify the current regime from the higher-TF slope gate, with the same
+    hysteresis as the backtest regime combiner: up = confirmed positive, down =
+    confirmed negative, else flat."""
+    if gate_col not in feats.columns:
+        return "flat"
+    g = pd.Series(feats[gate_col].values).fillna(0.0)
+    gd = np.sign(g)
+    up = gd.rolling(confirm, min_periods=confirm).min()
+    dn = gd.rolling(confirm, min_periods=confirm).max()
+    upv = float(up.iloc[-1]) if len(up) else 0.0
+    dnv = float(dn.iloc[-1]) if len(dn) else 0.0
+    if dnv < 0:
+        return "down"
+    if upv > 0:
+        return "up"
+    return "flat"
 
 
 def _live_gated(c, score, feats):
@@ -248,7 +299,7 @@ class Live:
                 self.fitting = False
             if not self.models:
                 return
-        if not self.retraining and (time.time() - (self.last_retrain or 0)) >= config.LIVE_RETRAIN_SECONDS:
+        if not self.retraining and (time.time() - (self.last_retrain or 0)) >= _RETRAIN_S:
             self.retraining = True
             threading.Thread(target=self._retrain_deployed, daemon=True).start()
         try:
@@ -272,15 +323,39 @@ class Live:
             c = full.iloc[-1]
             gate = _bc.get("trend_gate", "none")
             if _ENSEMBLE and len(self.models) > 1:
-                votes, wsum = 0.0, 0.0
-                for (mc, model, task), w in zip(self.models, _ens_weights):
-                    sc = float(predict_score(model, row.values, task)[0])
-                    votes += w * _live_gated(mc, sc, feats)
-                    wsum += w
-                vote = votes / max(wsum, 1e-9)
-                pos = 1 if vote >= _ens_vote_th else 0
-                score = vote
-                model_name = f"ensemble-{len(self.models)}"
+                if _RG_ENABLED:
+                    dom = _regime_class(feats, _rg_gate, _rg_confirm)
+                    if _rg_policy:
+                        thr = float((_rg_policy.get(dom) or {}).get("thr",
+                                                                    _ens_vote_th))
+                    else:
+                        thr = _rg_soft_low if dom == "up" else (
+                            _rg_soft_mid if dom == "flat" else _ens_vote_th)
+                    wrow = _rg_weights.get(dom) or _rg_weights.get("flat") or _ens_weights
+                    votes, wsum = 0.0, 0.0
+                    for (mc, model, task), w in zip(self.models, wrow):
+                        sc = float(predict_score(model, row.values, task)[0])
+                        votes += w * _live_gated(mc, sc, feats)
+                        wsum += w
+                    vote = votes / max(wsum, 1e-9)
+                    pos = 1 if vote >= thr else 0
+                    if pos and _rg_policy:
+                        from ensemble import cond_pass
+                        spec = _rg_policy.get(dom) or {}
+                        if not bool(cond_pass(spec.get("cond"), last_row).all()):
+                            pos = 0
+                    score = vote
+                    model_name = f"ensemble-{len(self.models)}[regime:{dom}]"
+                else:
+                    votes, wsum = 0.0, 0.0
+                    for (mc, model, task), w in zip(self.models, _ens_weights):
+                        sc = float(predict_score(model, row.values, task)[0])
+                        votes += w * _live_gated(mc, sc, feats)
+                        wsum += w
+                    vote = votes / max(wsum, 1e-9)
+                    pos = 1 if vote >= _ens_vote_th else 0
+                    score = vote
+                    model_name = f"ensemble-{len(self.models)}"
             else:
                 score = float(predict_score(self.models[0][1], row.values, self.task)[0])
                 pos = _live_gated(_bc, score, feats)
@@ -301,6 +376,7 @@ class Live:
                 "uptime_s": int(time.time() - self.started),
                 "model_ts": self.model_ts,
                 "retrained_at": self.last_retrain,
+                "retrain_cadence_h": round(_RETRAIN_S / 3600.0, 1),
                 "retraining": bool(self.retraining),
                 "train_n": int(self.train_n),
                 "last_retrain_err": self.last_retrain_err,
@@ -410,7 +486,9 @@ def index():
 @app.get("/api/health")
 def health():
     return {"ok": True, "artifact": ARTIFACT_NAME, "live": _live.last is not None,
-            "live_err": getattr(_live, "err", None)}
+            "live_err": getattr(_live, "err", None),
+            "retrain_cadence_h": round(_RETRAIN_S / 3600.0, 1),
+            "retrain_due_in_s": max(0, int(_RETRAIN_S - (time.time() - (getattr(_live, "last_retrain", None) or 0)))) if _live.last is not None else None}
 
 
 @app.get("/api/ohlcv")

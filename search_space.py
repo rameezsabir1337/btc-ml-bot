@@ -51,13 +51,13 @@ LABEL_SPACE = {
         "horizon": None,                 # -> config.MODE_HORIZONS at build time
         "tp_frac": [0.002, 0.004, 0.006],
         "sl_frac": [0.001, 0.002, 0.003],
-        "margin": [0.0, 0.15, 0.3],
+        "margin": [0.0, 0.15, 0.3, 0.45],
     },
     "triple_atr": {
         "horizon": None,                 # -> config.MODE_HORIZONS at build time
         "tp_atr_mult": [1.0, 1.5, 2.0],  # TP = close + k*ATR (vol-adaptive)
         "sl_atr_mult": [0.5, 1.0, 1.5],  # SL = close - k*ATR
-        "margin": [0.0, 0.15, 0.3],
+        "margin": [0.0, 0.15, 0.3, 0.45],
     },
     "regression": {
         "horizon": None,                 # -> config.MODE_HORIZONS at build time
@@ -80,7 +80,8 @@ def active_trend_gates() -> list[str]:
 # (tp, sl) / (tp_atr, sl_atr) exit spaces removed: the bot is signal-only, no TP/SL.
 VOL_TARGETS = [0.0, 0.10, 0.15, 0.20, 0.25]   # realized-vol target sizing
 DD_BRAKES = [0.0, 0.03, 0.05, 0.08]            # exposure brake at running drawdown
-FUNDING_GATES = [0.0, 1.5, 2.0, 3.0]           # funding-z threshold; 0 = off
+FUNDING_GATES = [0.0, 1.5, 2.0, 3.0, 4.0]      # funding-z threshold; 0 = off
+MIN_HOLDS = [0, 3, 5, 8]                       # min-hold bars (anti-churn, fee saver)
 
 
 def build_configs(seed=None) -> list[dict]:
@@ -114,6 +115,7 @@ def build_configs(seed=None) -> list[dict]:
                             "vol_target": rng.choice(VOL_TARGETS),
                             "dd_brake": rng.choice(DD_BRAKES),
                             "funding_gate": rng.choice(FUNDING_GATES if _cfg.GATES_ON else [0.0]),
+                            "min_hold_bars": rng.choice(MIN_HOLDS),
                         })
     if len(configs) > _cfg.GRID.max_configs:
         configs = rng.sample(configs, _cfg.GRID.max_configs)

@@ -161,12 +161,14 @@ def backtest(signals: np.ndarray, close: np.ndarray, cfg: BacktestConfig = None,
 
 
 def objective(metrics: dict, cfg) -> float:
-    """Risk-adjusted objective = sharpe - w*|maxDD|; penalized if too few trades."""
+    """Risk-adjusted objective = sharpe - w_dd*|maxDD| + w_win*(win_rate-0.5);
+    penalized if too few trades."""
     if metrics["num_trades"] < cfg.min_config_trades:
         return -1e9
     sharpe = metrics["sharpe"]
     dd_pen = cfg.objective_weight_drawdown * abs(metrics["max_drawdown"])
-    return sharpe - dd_pen
+    win_bonus = cfg.objective_weight_winrate * (metrics.get("win_rate", 0.0) - 0.5)
+    return sharpe - dd_pen + win_bonus
 
 
 def summarize(metrics_list: list[dict]) -> dict:

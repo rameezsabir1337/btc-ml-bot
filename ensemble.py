@@ -60,6 +60,70 @@ def _fold_sharpes(member, X, df, arrs, folds):
     return np.asarray(out)
 
 
+# ---------------------------------------------------------------------------
+# Regime-adaptive entry policy (shared by walk-forward + live dashboard)
+# ---------------------------------------------------------------------------
+# Per-regime vote threshold plus an entry condition evaluated on the bar.
+# `cond` is a list of AND-ed groups; inside a group the clauses are OR-ed.
+# Clauses are "col<op>value".
+#   up   -> long only while BOTH the 12- and 6-bar EMA filters are up (thr 0.0)
+#   flat -> any member long + positive 6-bar momentum             (thr 0.1)
+#   down -> counter-trend bounce: >=3 members long + above 12-bar EMA (0.6)
+# Equal member weights are used so no fold's own OOS Sharpe leaks into its
+# own positions (the Sharpe-weighted vote was the source of the negative folds).
+ENTRY_POLICY = {
+    "up":   {"thr": 0.0, "cond": [["ema_off_12>0"], ["ema_off_6>0"]]},
+    "flat": {"thr": 0.1, "cond": [["ret_6>0"]]},
+    "down": {"thr": 0.6, "cond": [["ema_off_12>0"]]},
+}
+
+
+def cond_pass(cond, Xsl):
+    """Evaluate a policy `cond` spec against feature frame `Xsl` -> bool array.
+    Groups are AND-ed; clauses inside a group are OR-ed."""
+    if not cond:
+        return np.ones(len(Xsl), dtype=bool)
+    out = np.ones(len(Xsl), dtype=bool)
+    for group in cond:
+        g = np.zeros(len(Xsl), dtype=bool)
+        for clause in group:
+            for op in (">=", "<=", "==", ">", "<"):
+                i = clause.find(op)
+                if i > 0:
+                    col, val = clause[:i], float(clause[i + len(op):])
+                    s = np.asarray(Xsl[col], dtype=float)
+                    s = np.nan_to_num(s, nan=0.0)
+                    if op == ">":
+                        g |= s > val
+                    elif op == ">=":
+                        g |= s >= val
+                    elif op == "<":
+                        g |= s < val
+                    elif op == "<=":
+                        g |= s <= val
+                    else:
+                        g |= s == val
+                    break
+        out &= g
+    return out
+
+
+def apply_entry_policy(pos, masks, policy, Xsl):
+    """Zero longs whose regime's entry condition fails on that bar."""
+    pos = np.asarray(pos, dtype=float).copy()
+    long_ = pos > 0
+    if not long_.any():
+        return pos
+    for cls in ("up", "flat", "down"):
+        spec = (policy or {}).get(cls)
+        if not spec:
+            continue
+        sel = long_ & np.asarray(masks[cls], dtype=bool)
+        if not sel.any():
+            continue
+        pos[sel & ~cond_pass(spec.get("cond"), Xsl)] = 0.0
+    return pos
+
 def _metrics_from_ret(ret, eq_start, eq_seg, pos, bps):
     """Per-fold metrics sliced from a continuous (rolled) equity curve.
     `pos` is the position series aligned 1:1 to `ret` (len(pos)==len(ret))."""
@@ -175,6 +239,86 @@ def weighted_vote_walkforward(members, X, df, arrs, folds, weights=None, vote=0.
         m = _bt(members, fold, pos, arrs, ts)
         m["scores"] = votes
         fold_metrics.append(m)
+    return fold_metrics
+
+
+def regime_vote_walkforward(members, X, df, arrs, folds, weights=None, vote=0.5,
+                            gate_col="htf10080_slope", confirm=2,
+                            soft=(0.30, 0.50), return_table=False,
+                            weights_equal=False, entry_policy=None):
+    """V1b (Option B): per-fold Sharpe-weighted majority vote over member GATED
+    positions, but the vote threshold adapts to the higher-TF regime so we add
+    SELECTIVE long entries in confirmed up-trends (weak members barely count and
+    can't clear a fixed 0.5-0.65 bar) while bear folds stay protected because the
+    member trend-gates already force positions flat.
+
+    Regime (from the weekly-slope gate, hysteresis = `confirm` bars):
+      strongly up (confirmed >0)  -> low  threshold (aggressive selective longs)
+      weak up / flat (>=0)        -> mid  threshold
+      down (confirmed <0)         -> high threshold; members' own down-gate also
+                                     blocks, so no longs in bear (folds 2/3)
+
+    With `entry_policy` (see ENTRY_POLICY) the per-regime threshold AND the
+    per-regime entry condition come from the policy, and `weights_equal` forces
+    a uniform member vote so no fold's own OOS Sharpe leaks into its positions.
+    """
+    import pandas as pd
+    if weights is None:
+        weights = np.asarray([_fold_sharpes(m, X, df, arrs, folds) for m in members])
+    if weights_equal:
+        weights = np.ones_like(np.asarray(weights, dtype=float))
+    else:
+        weights = np.clip(weights, 1e-3, None)   # keep every member voting (V1 parity)
+    low_th, mid_th = soft
+    fold_metrics = []
+    regime_rows = []   # (regime_class, fold_weights_row) for live weight selection
+    for fi, fold in enumerate(folds):
+        sl = slice(fold.test_start, fold.test_end)
+        gate = pd.Series(X[gate_col].values[sl]).fillna(0.0)
+        gd = np.sign(gate)
+        up = gd.rolling(confirm, min_periods=confirm).min().fillna(0.0)     # >=0 weak up
+        dn = gd.rolling(confirm, min_periods=confirm).max().fillna(0.0)     # <0 confirmed down
+        strong_up = (up > 0).to_numpy()
+        down = (dn < 0).to_numpy()
+        # dominant regime over the fold window, for live weight selection
+        n_up = int(strong_up.sum())
+        n_dn = int(down.sum())
+        n_flat = len(strong_up) - n_up - n_dn
+        dom = "up" if n_up >= max(n_dn, n_flat) else ("down" if n_dn > n_flat else "flat")
+        wrow = [float(weights[mi, fi]) for mi in range(len(members))]
+        regime_rows.append((dom, wrow))
+        thr = np.full(fold.test_end - fold.test_start, mid_th)
+        thr[strong_up] = low_th
+        thr[down] = vote  # lean conservative when confirmed down (belt & braces)
+        if entry_policy:
+            n = fold.test_end - fold.test_start
+            thr = np.full(n, float(entry_policy.get("flat", {}).get("thr", 0.5)))
+            thr[strong_up] = float(entry_policy.get("up", {}).get("thr", 0.5))
+            thr[down] = float(entry_policy.get("down", {}).get("thr", 0.5))
+
+        acc = np.zeros(fold.test_end - fold.test_start)
+        wsum = 0.0
+        ts = None
+        for mi, m in enumerate(members):
+            r = _member_fold(m, X, df, arrs, fold)
+            if r is None:
+                continue
+            _, pos, ts = r
+            acc += weights[mi, fi] * pos
+            wsum += weights[mi, fi]
+        if wsum <= 0:
+            continue
+        votes = acc / wsum
+        pos = (votes >= thr).astype(float)
+        if entry_policy:
+            masks = {"up": strong_up, "down": down,
+                     "flat": ~strong_up & ~down}
+            pos = apply_entry_policy(pos, masks, entry_policy, X.iloc[sl])
+        m = _bt(members, fold, pos, arrs, ts)
+        m["scores"] = votes
+        fold_metrics.append(m)
+    if return_table:
+        return fold_metrics, regime_rows
     return fold_metrics
 
 

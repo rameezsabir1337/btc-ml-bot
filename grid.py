@@ -78,7 +78,7 @@ def _bt_cfg(c, arrs, sl) -> BacktestConfig:
     import config as _cfg
     return BacktestConfig(
         min_signal_margin=c["margin"],
-        min_hold_bars=MIN_HOLD_BARS,
+        min_hold_bars=int(c.get("min_hold_bars", MIN_HOLD_BARS)),
         vol_target=float(c.get("vol_target", 0.0) or 0.0),
         dd_brake=float(c.get("dd_brake", 0.0) or 0.0),
         bars_per_year=_cfg.BARS_PER_YEAR,
@@ -260,18 +260,23 @@ def ensemble_walkforward(top_configs, X, df, arrs, vote=0.5):
     return folds, fold_metrics, trades_by_fold, rolled
 
 
-def combined_walkforward(members, X, df, arrs, combine="vote", vote=0.5):
+def combined_walkforward(members, X, df, arrs, combine="vote", vote=0.5,
+                         regime=None):
     """Out-of-sample evaluation of an ensemble, chained into ONE equity curve.
-      'vote'  -> per-fold Sharpe-weighted majority vote over gated positions (V1)
-      'blend' -> average member scores, threshold by the winner's margin, uses
-                 the htf1440 trend gate (V2, long-only aware).
+      'vote'   -> per-fold Sharpe-weighted majority vote over gated positions (V1)
+      'regime' -> same, but the vote threshold adapts to the higher-TF regime so
+                  selective longs are added in confirmed up-trends (Option B);
+                  bear folds stay protected by the members' own down-gates.
+      'blend'  -> average member scores, threshold by the winner's margin, uses
+                  the htf1440 trend gate (V2, long-only aware).
     Returns (folds, fold_metrics, trades_by_fold, rolled, weights) where
     `weights` = mean per-fold OOS Sharpe of each member (vote weights, clipped
     at 1e-3 so persistently-negative members are silenced)."""
     import config as _cfg
     import numpy as np
     from ensemble import (chain_folds, weighted_vote_walkforward,
-                          blend_walkforward, _fold_sharpes)
+                          regime_vote_walkforward, blend_walkforward,
+                          _fold_sharpes)
     folds = expanding_folds(len(X), WF, horizon=members[0]["label"]["horizon"])
     if combine == "blend":
         fm = blend_walkforward(members, X, df, arrs, folds, margin=members[0]["margin"])
@@ -279,12 +284,40 @@ def combined_walkforward(members, X, df, arrs, combine="vote", vote=0.5):
     else:
         wgrid = np.asarray([_fold_sharpes(m, X, df, arrs, folds) for m in members])
         weights = np.clip(wgrid.mean(axis=1), 1e-3, None)
-        fm = weighted_vote_walkforward(members, X, df, arrs, folds,
-                                       weights=wgrid, vote=vote)
+        if combine == "regime":
+            rg = regime or {}
+            entry_policy = rg.get("entry_policy")
+            w_eq = bool(rg.get("weights_equal", False))
+            if w_eq:
+                weights = [1.0] * len(members)
+                wgrid_use = np.ones_like(wgrid)
+            else:
+                wgrid_use = wgrid
+            fm, rg_table = regime_vote_walkforward(
+                members, X, df, arrs, folds, weights=wgrid_use, vote=vote,
+                gate_col=rg.get("gate_col", "htf10080_slope"),
+                confirm=int(rg.get("confirm", 2)),
+                soft=(float(rg.get("soft_low", 0.30)), float(rg.get("soft_mid", 0.50))),
+                return_table=True,
+                weights_equal=w_eq,
+                entry_policy=entry_policy)
+        else:
+            fm = weighted_vote_walkforward(members, X, df, arrs, folds,
+                                           weights=wgrid, vote=vote)
     fm, rolled = chain_folds(fm, folds, arrs,
                              _bt_cfg(members[0], arrs, slice(0, 0)),
                              _cfg.BARS_PER_YEAR)
     trades_by_fold = _trades_table(folds, fm, arrs)
+    if combine == "regime":
+        rolled["_regime"] = {
+            "classes": ["up", "flat", "down"],
+            "rows": rg_table,   # (class, member weights) per fold
+            "soft_low": float((regime or {}).get("soft_low", 0.30)),
+            "soft_mid": float((regime or {}).get("soft_mid", 0.50)),
+            "entry_policy": (regime or {}).get("entry_policy"),
+            "weights_equal": bool((regime or {}).get("weights_equal", False)),
+        }
+        return folds, fm, trades_by_fold, rolled, [float(w) for w in weights]
     return folds, fm, trades_by_fold, rolled, [float(w) for w in weights]
 
 
